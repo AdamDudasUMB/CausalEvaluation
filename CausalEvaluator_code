@@ -1,0 +1,140 @@
+import pandas as pd
+import numpy as np
+from itertools import combinations
+from io import StringIO
+from google import genai
+import seaborn as sns
+import matplotlib.pyplot as plt
+from google.genai import types
+
+################# INPUT - user defined parameters about data and key for LLM
+
+DATASET = "graphs.csv"
+SEPARATOR = ";"
+
+TASK = "NEW" #select: NEW for identification of new relationships, or CAUS for the task of causality analysis
+AREA = "Graphs theory"
+
+GEMINI_API_KEY = "" #insert google genai key for Gemini
+
+################# SETUP - reading of the dataset, outlier identification (via IQR rule), (basic) correlation analysis, identification of all attribute pairs
+
+data = pd.read_csv(DATASET, sep = SEPARATOR)
+numeric_data = data.select_dtypes(include=[np.number])
+
+def has_outliers(df):
+    for col in df.columns:
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        if ((df[col] < lower_bound) | (df[col] > upper_bound)).any():
+            return True
+    return False
+
+if has_outliers(numeric_data):
+    corr_mat = numeric_data.corr(method='spearman')
+else:
+    corr_mat = numeric_data.corr(method='pearson')
+
+cols = numeric_data.columns.tolist()
+attributes = []
+
+for a, b in combinations(cols, 2):
+    attributes.append(f"{a},{b}")
+
+################# LLM EVAL - omega estimation
+
+client = genai.Client(api_key = GEMINI_API_KEY)
+comma = ","
+
+if TASK == "NEW":
+    
+    query = f"Identify general familiarity of the relationship between pairs of attributes: {attributes}. Evaluate these relationship as follows known = 0.1 | moderately know = 0.3 | neutral = 0.5 | moderately unknown = 0.7 | unknown = 1. The data come from the area of {AREA}. Print only the pair title and the score - all separated by {comma}."
+    
+    response = client.models.generate_content(
+    model="gemini-2.5-flash", contents=query, config = types.GenerateContentConfig(temperature = 0))
+
+elif TASK == "CAUS":
+   query = f"Identify general familiarity of the relationship between pairs of attributes: {attributes}. Evaluate these relationship as follows known = 1 | moderately know = 0.7 | neutral = 0.5 | moderately unknown = 0.3 | unknown = 0.1. The data come from the area of {AREA}. Print only the pair title and the score - all separated by {comma}."
+   
+   response = client.models.generate_content(
+   model="gemini-2.5-flash", contents=query, config = types.GenerateContentConfig(temperature = 0))
+
+################# CAUSAL MATRIX
+
+causality = pd.read_csv(StringIO(response.text), header=None, names=['col1', 'col2', 'multiplier'])
+
+for _, row in causality.iterrows():
+    corr_mat.loc[row['col1'], row['col2']] *= row['multiplier']
+    corr_mat.loc[row['col2'], row['col1']] *= row['multiplier']
+
+np.fill_diagonal(corr_mat.values, np.nan)
+    
+mult_sum = (
+    pd.concat([
+        causality[['col1', 'multiplier']].rename(columns={'col1': 'attribute'}),
+        causality[['col2', 'multiplier']].rename(columns={'col2': 'attribute'})
+    ])
+    .groupby('attribute', as_index=False)['multiplier'].sum()
+)
+
+print(mult_sum)
+
+################# VISUALIZATION - heatmap, bargraph, composition
+
+mult_sum = mult_sum.set_index('attribute').reindex(corr_mat.index).fillna(0)
+
+
+fig = plt.figure(figsize=(12, 12))
+from matplotlib.gridspec import GridSpec
+gs = GridSpec(1, 2, width_ratios=[20, 3], wspace= 0.025)  # adjust spacing
+
+ax_heatmap = fig.add_subplot(gs[0, 0])
+cbar_ax = fig.add_axes([0.25, 0.92, 0.5, 0.03])
+
+sns.heatmap(
+    corr_mat,
+    cmap=sns.cubehelix_palette(start=.5, rot=-.5, as_cmap=True),
+    center=0,
+    square=True,
+    cbar=True,
+    cbar_ax=cbar_ax,
+    cbar_kws={"orientation": "horizontal"},
+    annot=True,
+    vmin=-1,
+    vmax=1,
+    ax=ax_heatmap
+)
+
+cbar_ax.xaxis.set_ticks_position("top")
+cbar_ax.xaxis.set_label_position("top")
+
+
+
+ax_bar = fig.add_subplot(gs[0, 1], sharey=ax_heatmap)
+ax_bar.barh(
+    y=np.arange(len(mult_sum.index)) + 0.5,   
+    width=mult_sum['multiplier'],
+    height=0.5,                               
+    color="#7fb1be"
+)
+
+ax_bar.set_yticks(np.arange(len(mult_sum.index)) + 0.5)
+ax_bar.set_yticklabels(mult_sum.index)
+
+
+ax_bar.xaxis.set_ticks_position("top")
+ax_bar.xaxis.set_label_position("top")
+ax_bar.tick_params(axis="x", top=True, bottom=False)
+
+ax_bar.set_xlabel(r"$\Sigma \omega$", labelpad=10)
+ax_bar.yaxis.set_visible(False)
+sns.despine(ax=ax_bar, left=True, bottom = True, top = False)
+
+plt.subplots_adjust(left=0.2, right=0.97, top=0.88, bottom=0.2, wspace=0.0) #plt.subplots_adjust(left=0.05, right=0.97, top=0.88, bottom=0.05, wspace=0.0)
+
+fig_title = f"{DATASET}_map_{TASK}.png"
+
+plt.savefig(fig_title, dpi = 1200)
